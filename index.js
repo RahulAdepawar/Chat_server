@@ -1,29 +1,18 @@
-const express = require("express");
-const pool = require("./db_connect.js");
-const cors = require("cors");
-const bcrypt = require("bcryptjs");
-const cookieParser = require("cookie-parser");
-const jwt = require("jsonwebtoken");
-const authMiddleware = require("./middleware/auth.js");
+
+const { express, pool, cors, bcrypt, cookieParser, jwt, authMiddleware, admin, fs, http, path, Server } = require("./imports.js");
+
+const app = express();
+const PORT = process.env.PORT || 8000;
+const server = http.createServer(app);
 
 const {
 	upload_chat_doc,
 	processChatUploads,
 } = require("./middleware/multer.js");
 
-
-const fs = require("fs");
-
 const upload = require("./upload");
 
-const http = require("http");
-const path = require("path");
-
-const app = express();
-const PORT = process.env.PORT || 8000;
-
-const { Server } = require("socket.io");
-const server = http.createServer(app);
+// const { io } = require("./socketio.js");
 
 const io = new Server(server, {
 	cors: {
@@ -36,6 +25,7 @@ const socketAuth = require("./middleware/socketAuth.js");
 io.use(socketAuth);
 io.on("connection", (socket) => {
 	const userId = socket.user.user_id;
+	console.log("userId", userId)
 	console.log("🟢 Socket connected:", socket.id, "User:", userId);
 
 	socket.on("join_chat", async (roomId) => {
@@ -177,6 +167,7 @@ app.post("/api/login", async (req, res) => {
 		const result = await pool.query(
 			`SELECT user_id, password FROM users WHERE email = '${username}'`
 		);
+
 		if (result.rowCount === 0) {
 			return res.json({ status: 401, success: false, message: "Invalid credentials" });
 		}
@@ -337,57 +328,53 @@ app.get("/api/get_contacts", authMiddleware, async (req, res) => {
 	try {
 		const loggedInUserId = req.user.user_id;
 
-		// 🔎 Find contact user
 		const result = await pool.query(
-			`SELECT 
+			`SELECT
 				c.contact_list_id,
 				c.contact_user_id,
 				c.contact_user_name,
 				c.mute,
 				c.is_saved,
 				u.profile_image,
-				COALESCE(v.last_message, '') AS last_message,
-				v.last_sender_id,
-				COALESCE(v.pending, 0) AS pending
+				COALESCE(lm.last_message, '') AS last_message,
+				lm.last_sender_id,
+				lm.last_time AS last_time,
+				COALESCE(unread.pending, 0) AS pending
 			FROM contact_list c
-			JOIN users u 
-				ON u.user_id = c.contact_user_id
-			LEFT JOIN chats ch
-				ON ch.user1_id = LEAST($1, c.contact_user_id)
-				AND ch.user2_id = GREATEST($1, c.contact_user_id)
-			LEFT JOIN (
-				SELECT
-					M.chat_id,
-					(
-						SELECT content
-						FROM messages m2
-						WHERE m2.chat_id = M.chat_id
-						ORDER BY m2.created_at DESC
-						LIMIT 1
-					) AS last_message,
-					(
-						SELECT sender_id
-						FROM messages m2
-						WHERE m2.chat_id = M.chat_id
-						ORDER BY m2.created_at DESC
-						LIMIT 1
-					) AS last_sender_id,
-					COUNT(*) AS pending
-				FROM messages M
-				JOIN message_status MS 
-					ON MS.message_id = M.message_id
-				WHERE
-					MS.user_id = $1
-					AND MS.status = 'sent'
-					AND MS.user_id <> M.sender_id
-				GROUP BY
-					M.chat_id
-			) v ON v.chat_id = ch.chat_id
-			WHERE 
-				c.user_id = $1
-			ORDER BY
-				pending DESC;
+				JOIN users u ON u.user_id = c.contact_user_id
+				LEFT JOIN chats ch
+					ON ch.user1_id = LEAST($1, c.contact_user_id)
+					AND ch.user2_id = GREATEST($1, c.contact_user_id)
 
+				LEFT JOIN (
+					SELECT DISTINCT ON (chat_id)
+						chat_id,
+						content AS last_message,
+						sender_id AS last_sender_id,
+						created_at AS last_time
+					FROM messages
+					ORDER BY 
+						chat_id, 
+						created_at DESC
+				) lm ON lm.chat_id = ch.chat_id
+
+				LEFT JOIN (
+					SELECT
+						M.chat_id,
+						COUNT(*) AS pending
+					FROM messages M
+					JOIN message_status MS ON MS.message_id = M.message_id
+					WHERE MS.user_id = $1
+						AND MS.status = 'sent'
+						AND MS.user_id <> M.sender_id
+					GROUP BY 
+						M.chat_id
+				) unread ON unread.chat_id = ch.chat_id
+
+				WHERE 
+					c.user_id = $1
+				ORDER BY 
+					lm.last_time DESC NULLS LAST;
 			`,
 			[loggedInUserId]
 		);
@@ -578,6 +565,26 @@ app.post(
 				[savedMessage.id, senderId, receiverId]
 			);
 
+			const fcm_tokens = await pool.query(
+				"SELECT token FROM fcm_tokens WHERE user_id = $1",
+				[receiverId]
+			);
+			if (fcm_tokens.rows.length > 0) {
+				const tokens = fcm_tokens.rows.map(row => row.token);
+				console.log("tokens", tokens)
+
+				await admin.messaging().sendEachForMulticast({
+					tokens,
+					data: {
+						title: "New Message",
+						body: message,
+						senderId: String(senderId),
+						type: "chat",
+					},
+				});
+
+			}
+
 			const result = await pool.query(`SELECT
 					m.message_id AS id,
 					m.sender_id,
@@ -599,6 +606,7 @@ app.post(
 			// ✅ Socket emit
 			const roomId = [senderId, receiverId].sort((a, b) => a - b).join("_");
 			io.to(roomId).emit("receive_message", getMessage);
+			io.emit("new_message", getMessage);
 
 			res.json({ success: true, data: getMessage });
 		} catch (err) {
@@ -1042,6 +1050,160 @@ app.get("/api/tasks/assigned", authMiddleware, async (req, res) => {
 		return res.status(500).json({ message: "Failed to load tasks list" });
 	}
 });
+
+app.post(
+	"/api/tasks/send_message",
+	authMiddleware,
+	upload_chat_doc.array("attachments", 5),
+	processChatUploads,
+	async (req, res) => {
+		const sender_id = req.user.user_id;
+		let { assignTo, task_id, message } = req.body;
+
+		assignTo = parseInt(assignTo, 10);
+		console.log("assignTo", assignTo)
+		console.log("sender_id", sender_id)
+
+		if (Number.isNaN(assignTo)) {
+			return res.status(400).json({ message: "Invalid contactId" });
+		}
+
+		const attachments = req.attachments || [];
+
+		const hasText = typeof message === "string" && message.trim().length > 0;
+		const hasFiles = attachments.length > 0;
+
+		if (!assignTo || (!hasText && !hasFiles)) {
+			return res.status(400).json({ message: "Message cannot be empty" });
+		}
+
+		const client = await pool.connect(); // 🔑 IMPORTANT
+
+		try {
+
+			await client.query("BEGIN");
+
+			// ✅ Insert message
+			const messageResult = await pool.query(
+				`INSERT INTO task_discussion (
+					task_id, 
+					sender_id, 
+					content,
+					attachments
+				) VALUES (
+				 	$1, 
+					$2, 
+					$3,
+					$4
+				)
+				RETURNING
+					task_discussion_id AS id`,
+				[
+					task_id,
+					sender_id,
+					hasText ? message.trim() : null,
+					attachments.length ? JSON.stringify(attachments) : null,
+				]
+			);
+
+			const savedMessage = await messageResult.rows[0];
+
+			// ✅ Message status
+			// await pool.query(
+			// 	`INSERT INTO message_status (message_id, user_id, status)
+			// 	 VALUES
+			// 	 ($1, $2, 'sent'),
+			// 	 ($1, $3, 'sent')`,
+			// 	[savedMessage.id, senderId, assignTo]
+			// );
+
+			const result = await pool.query(`SELECT 
+					td.task_discussion_id,
+					td.task_id,
+					td.content AS message,
+					td.created_at,
+					u.user_id,
+					u.username AS sender_name,
+					u.profile_image
+				FROM task_discussion td
+					JOIN users u ON u.user_id = td.sender_id
+				WHERE 
+					td.task_id = $1
+				ORDER BY 
+					td.created_at ASC`,
+				[savedMessage.id]
+			);
+
+			const getMessage = result.rows[0];
+			await client.query("COMMIT");
+
+			res.json({ success: true, data: getMessage });
+		} catch (err) {
+			await client.query("ROLLBACK");
+			console.error("send_message error:", err);
+			res.status(500).json({ message: "Failed to send message" });
+		}
+	}
+);
+
+app.get("/api/tasks/get_messages/:assignTo/:taskId", authMiddleware, async (req, res) => {
+	const userId = parseInt(req.user.user_id, 10); // ✅ FIX
+	const assignTo = parseInt(req.params.assignTo, 10);
+	const taskId = parseInt(req.params.taskId, 10);
+
+	if (isNaN(userId) || isNaN(assignTo)) {
+		return res.status(400).json({ message: "Invalid userId or contactId" });
+	}
+
+	try {
+
+		const messagesResult = await pool.query(
+			`SELECT
+				td.task_discussion_id,
+				td.content AS message,
+				td.attachments,
+				td.created_at,
+				u.user_id,
+				u.username AS sender_name,
+				u.profile_image
+			FROM task_discussion td
+			JOIN users u ON u.user_id = td.sender_id
+			WHERE td.task_id = $1
+			ORDER BY td.created_at ASC;
+			`,
+			[taskId]
+		);
+
+		return res.json({
+			success: true,
+			data: messagesResult.rows,
+		});
+	} catch (err) {
+		console.error(err);
+		res.status(500).json({ message: "Failed to load messages" });
+	}
+});
+
+app.post("/api/save-fcm-token", authMiddleware, async (req, res) => {
+	const userId = parseInt(req.user.user_id, 10); // ✅ FIX
+	const { token } = req.body;
+
+	if (!token) return res.status(400).json({ error: "Token required" });
+
+	await pool.query(`INSERT INTO fcm_tokens (
+				user_id, 
+				token
+			) VALUES (
+				$1, 
+				$2
+			) ON CONFLICT (token)
+			DO UPDATE SET user_id = EXCLUDED.user_id `,
+		[userId, token]
+	);
+
+	res.json({ success: true });
+});
+
 
 server.listen(PORT, () => {
 	console.log("🚀 Server + Socket.IO running on port", PORT);
