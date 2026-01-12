@@ -573,15 +573,44 @@ app.post(
 				const tokens = fcm_tokens.rows.map(row => row.token);
 				console.log("tokens", tokens)
 
-				await admin.messaging().sendEachForMulticast({
-					tokens,
-					data: {
-						title: "New Message",
-						body: message,
-						senderId: String(senderId),
-						type: "chat",
-					},
-				});
+				  try {
+			        const response = await admin.messaging().sendEachForMulticast({
+			            tokens,
+			            data: {
+			                title: "New Message",
+			                body: message,
+			                senderId: String(senderId),
+			                type: "chat",
+			            },
+			        });
+			
+			        console.log("Total success:", response.successCount);
+			        console.log("Total failure:", response.failureCount);
+			
+			        response.responses.forEach((res, idx) => {
+			            if (res.success) {
+			                console.log(`Message sent to token[${idx}]`);
+			            } else {
+			                console.log(
+			                    `Failed to send to token[${idx}]:`,
+			                    res.error?.message
+			                );
+			            }
+			        });
+			
+			    } catch (error) {
+			        console.log("FCM send error:", error);
+			    }
+							
+				// await admin.messaging().sendEachForMulticast({
+				// 	tokens,
+				// 	data: {
+				// 		title: "New Message",
+				// 		body: message,
+				// 		senderId: String(senderId),
+				// 		type: "chat",
+				// 	},
+				// });
 
 			}
 
